@@ -120,6 +120,7 @@ def app_ui_html(shop: str, sample_order: dict, configured: bool) -> str:
 <h1>GST Invoice</h1>
 <p class="status">Status: service live. {html.escape(status)}</p>
 {f'<p class="status">Shop: {shop_txt}</p>' if shop_txt else ''}
+{f'<p><a href="/settings?shop={shop_txt}">Seller settings</a> · <a href="/orders?shop={shop_txt}">Recent orders</a></p>' if shop_txt else ''}
 <p>Try it: generate an invoice from the bundled sample intra-state order.</p>
 <button id="demo" type="button">Generate demo invoice</button>
 <iframe id="out" title="Invoice preview"></iframe>

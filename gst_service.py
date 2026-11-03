@@ -10,6 +10,8 @@ as-is; its core logic is untouched.
 Endpoints:
     GET  /health   -> {"status": "ok"}
     POST /invoice  -> Shopify order JSON in, invoice out.
+    Phase 2 (shopify_phase2.py): GET/POST /settings, GET /orders,
+    POST /order-invoice — seller settings, real orders, order invoices.
 
 Request body for POST /invoice — either form:
     1. A bare Shopify order object (seller config = server default), or
@@ -48,6 +50,8 @@ from pipeline import order_to_invoice, totals_sidecar  # noqa: E402
 from gst_invoice.render import render_html  # noqa: E402
 from gst_invoice.tax import compute_invoice  # noqa: E402
 from shopify_backend import route_get as shopify_route_get  # noqa: E402
+from shopify_phase2 import route_get as phase2_route_get  # noqa: E402
+from shopify_phase2 import route_post as phase2_route_post  # noqa: E402
 
 DEFAULT_SELLER = PACKAGE_DIR / "samples" / "seller.json"
 SAMPLE_ORDER = PACKAGE_DIR / "samples" / "order_intra_state.json"
@@ -96,11 +100,16 @@ def make_handler(default_seller: dict, sample_order: dict | None = None):
                 self._json(200, {"status": "ok"})
             elif shopify_route_get(self, sample_order or {}):
                 pass  # /, /auth, /auth/callback handled by shopify_backend
+            elif phase2_route_get(self, sample_order or {}):
+                pass  # /settings, /orders handled by shopify_phase2
             else:
                 self._json(404, {"error": "not found"})
 
         def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
-            if self.path != "/invoice":
+            from urllib.parse import urlparse
+            if phase2_route_post(self, default_seller):
+                return  # /settings, /order-invoice handled by shopify_phase2
+            if urlparse(self.path).path != "/invoice":
                 self._json(404, {"error": "not found"})
                 return
             try:

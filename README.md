@@ -29,6 +29,35 @@ Configuration comes only from environment variables (never files):
 (the app's public base URL). Without them the `/auth*` routes answer
 "not configured" while `/`, `/invoice` and `/health` keep working.
 
+## Phase 2 — settings, real orders, order invoices
+
+- `GET /settings?shop=` → seller settings form (prefilled). Fields:
+  business name, GSTIN (validated: 15 chars — 2-digit state code, 5
+  letters, 4 digits, 1 letter, 1 alphanumeric, `Z`, 1 alphanumeric —
+  and the state code must match the GSTIN's first 2 digits), address,
+  state code, invoice prefix, next invoice number.
+- `POST /settings?shop=` → validates and saves the settings.
+- `GET /orders?shop=` → the shop's 10 most recent orders from the
+  Shopify Admin API (2024-10), using the shop's stored OAuth token.
+  With no token it shows a "Connect / Re-authorize" page linking to
+  `/auth?shop=`.
+- `POST /order-invoice` `{shop, order_id}` → fetches the full order,
+  builds the GST invoice with the shop's saved settings (falling back
+  to the demo seller when none are saved) and returns the invoice HTML
+  (JSON incl. totals + html with `Accept: application/json`). The
+  invoice number comes from the shop's own series — prefix + next
+  number — and a number is consumed exactly once, only when the
+  invoice builds successfully. Note: unlike `POST /invoice`, this
+  route does not cross-check Shopify's header totals (real orders can
+  include shipping etc. that the line-item engine does not model).
+
+Storage: settings + the series counter are kept per shop in one JSON
+file under `DATA_DIR` (env, default `/tmp`) with an in-memory cache.
+**Limitation: on Render's free tier the disk is ephemeral — settings
+and the counter are lost on restart/redeploy.** A persistent database
+is planned for a later phase; this store is for the dev-store stage.
+Access tokens are still memory-only and never written to disk.
+
 ## Deploy (Render free tier)
 
 This repo carries a `render.yaml` Blueprint: web service, free plan,
@@ -38,4 +67,7 @@ start command `python3 gst_service.py` (binds `0.0.0.0:$PORT`).
 
 ```bash
 python3 test_deploy.py   # boots on $PORT and verifies both sample orders
+python3 test_backend.py  # OAuth + embedded UI checks (dummy env)
+python3 test_phase2.py   # settings/orders/order-invoice vs a local
+                         # stub Shopify API (dummy token, no network)
 ```
