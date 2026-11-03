@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: gst-invoice-shopify-service
+    runtime: python
+    plan: free
+    buildCommand: ""
+    startCommand: python3 gst_service.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12.0
+    healthCheckPath: /health
