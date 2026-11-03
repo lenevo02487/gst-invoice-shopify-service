@@ -47,8 +47,10 @@ sys.path.insert(0, str(PACKAGE_DIR))
 from pipeline import order_to_invoice, totals_sidecar  # noqa: E402
 from gst_invoice.render import render_html  # noqa: E402
 from gst_invoice.tax import compute_invoice  # noqa: E402
+from shopify_backend import route_get as shopify_route_get  # noqa: E402
 
 DEFAULT_SELLER = PACKAGE_DIR / "samples" / "seller.json"
+SAMPLE_ORDER = PACKAGE_DIR / "samples" / "order_intra_state.json"
 
 
 def build_invoice_payload(order: dict, seller_cfg: dict) -> tuple[dict, str]:
@@ -73,7 +75,7 @@ def build_invoice_payload(order: dict, seller_cfg: dict) -> tuple[dict, str]:
     return payload, render_html(invoice, totals)
 
 
-def make_handler(default_seller: dict):
+def make_handler(default_seller: dict, sample_order: dict | None = None):
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
 
@@ -89,8 +91,11 @@ def make_handler(default_seller: dict):
                        "application/json; charset=utf-8")
 
         def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
-            if self.path == "/health":
+            from urllib.parse import urlparse
+            if urlparse(self.path).path == "/health":
                 self._json(200, {"status": "ok"})
+            elif shopify_route_get(self, sample_order or {}):
+                pass  # /, /auth, /auth/callback handled by shopify_backend
             else:
                 self._json(404, {"error": "not found"})
 
@@ -129,13 +134,18 @@ def main(argv: list[str]) -> int:
     # Hosting platforms (Render etc.) inject $PORT and need 0.0.0.0.
     ap.add_argument("--port", type=int,
                     default=int(os.environ.get("PORT", "8787")))
-    ap.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
+    # NOTE: $HOST doubles as the Shopify app's public base URL (a full
+    # https:// URL) — never bind to it. Bind host: --host / GST_BIND_HOST.
+    ap.add_argument("--host", default=os.environ.get("GST_BIND_HOST",
+                                                     "0.0.0.0"))
     ap.add_argument("--seller", default=os.environ.get(
         "GST_SELLER_JSON", str(DEFAULT_SELLER)))
     args = ap.parse_args(argv[1:])
 
     seller_cfg = json.loads(Path(args.seller).read_text())
-    server = ThreadingHTTPServer((args.host, args.port), make_handler(seller_cfg))
+    sample_order = json.loads(SAMPLE_ORDER.read_text())
+    server = ThreadingHTTPServer(
+        (args.host, args.port), make_handler(seller_cfg, sample_order))
     print(f"[gst-service] listening on http://{args.host}:{args.port} "
           f"(seller={args.seller})")
     try:
