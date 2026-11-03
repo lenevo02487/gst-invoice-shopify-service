@@ -26,12 +26,18 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 SHOP = "phase2-shop.myshopify.com"
 OTHER_SHOP = "other-shop.myshopify.com"
+THIRD_SHOP = "third-shop.myshopify.com"  # token held, NO saved settings
 TOKEN = "dummy_token"
 SVC = 8901
 STUB = 8902
 
 SAMPLE = json.loads((HERE / "samples" / "order_intra_state.json").read_text())
 SAMPLE = dict(SAMPLE, financial_status="paid")
+# Draft-order style: no customer and no shipping/billing address at all,
+# so no buyer state (province_code) can be read from the order.
+NOADDR = {k: v for k, v in SAMPLE.items()
+          if k not in ("shipping_address", "billing_address", "customer")}
+NOADDR = dict(NOADDR, id=6100001999, order_number=1002)
 
 
 class StubHandler(BaseHTTPRequestHandler):
@@ -43,6 +49,9 @@ class StubHandler(BaseHTTPRequestHandler):
         elif self.path.startswith(
                 f"/admin/api/2024-10/orders/{SAMPLE['id']}.json"):
             body, code = {"order": SAMPLE}, 200
+        elif self.path.startswith(
+                f"/admin/api/2024-10/orders/{NOADDR['id']}.json"):
+            body, code = {"order": NOADDR}, 200
         else:
             body, code = {"error": "not found"}, 404
         raw = json.dumps(body).encode()
@@ -93,7 +102,8 @@ def main() -> int:
                SHOPIFY_API_SECRET="dummy_test_secret",
                HOST="https://example-app.test",
                SHOPIFY_API_BASE=f"http://127.0.0.1:{STUB}",
-               SHOPIFY_TEST_TOKENS=json.dumps({SHOP: TOKEN}),
+               SHOPIFY_TEST_TOKENS=json.dumps({SHOP: TOKEN,
+                                               THIRD_SHOP: TOKEN}),
                DATA_DIR=data_dir)
     proc = subprocess.Popen(
         [sys.executable, str(HERE / "gst_service.py")],
@@ -165,6 +175,35 @@ def main() -> int:
                            ctype="application/json")
         check("order-invoice: no token -> 401 with auth link",
               status == 401 and "/auth?shop=" in body, f"status={status}")
+
+        status, body = req("POST", "/order-invoice",
+                           {"shop": SHOP, "order_id": NOADDR["id"]},
+                           ctype="application/json", accept="application/json")
+        payload = json.loads(body) if status == 200 else {}
+        t = payload.get("totals", {})
+        notes = payload.get("notes", [])
+        check("order-invoice: no-address order -> seller-state fallback",
+              status == 200 and payload.get("invoice_number") == "INV/502"
+              and t.get("place_of_supply_state_code") == "18"
+              and t.get("grand_total_rounded") == "11528"
+              and Decimal(t.get("total_igst", "1")) == 0
+              and Decimal(t.get("total_cgst", "0")) > 0
+              and any("seller state used" in n for n in notes)
+              and "seller state used" in payload.get("html", ""),
+              f"status={status} inv={payload.get('invoice_number')}")
+
+        status, body = req("POST", "/order-invoice",
+                           {"shop": THIRD_SHOP, "order_id": NOADDR["id"]},
+                           ctype="application/json", accept="application/json")
+        payload = json.loads(body) if status == 200 else {}
+        t = payload.get("totals", {})
+        notes = payload.get("notes", [])
+        check("order-invoice: no settings -> demo seller state fallback",
+              status == 200 and payload.get("invoice_number") == "SHP/1002"
+              and t.get("place_of_supply_state_code") == "18"
+              and Decimal(t.get("total_igst", "1")) == 0
+              and any("seller state used" in n for n in notes),
+              f"status={status} inv={payload.get('invoice_number')}")
     finally:
         proc.terminate()
         stub.shutdown()

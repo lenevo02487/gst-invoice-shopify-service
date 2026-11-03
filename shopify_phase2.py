@@ -12,7 +12,10 @@ pipeline (pipeline.order_to_invoice). The GST engine package
                               GST invoice with the shop's saved settings;
                               the invoice number comes from the shop's own
                               series (prefix + next number) and is consumed
-                              exactly once, only on success
+                              exactly once, only on success. An order with
+                              no usable buyer address/state falls back to
+                              the seller's state as place of supply, with
+                              a note recorded on the invoice
 
 Storage: per-shop settings + invoice-series counter live in one JSON
 file under DATA_DIR (env, default /tmp) with an in-memory cache.
@@ -40,7 +43,8 @@ from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
 
 import shopify_backend
-from pipeline import order_to_invoice, totals_sidecar
+from pipeline import (PROVINCE_TO_GST_CODE, gst_state_code,
+                      order_to_invoice, totals_sidecar)
 from gst_invoice.render import render_html
 from gst_invoice.tax import compute_invoice
 
@@ -187,6 +191,67 @@ def fetch_orders(shop: str) -> list[dict]:
 def fetch_order(shop: str, order_id: str) -> dict:
     data = api_get(shop, f"/admin/api/{API_VERSION}/orders/{order_id}.json")
     return data["order"]
+
+
+# ------------------------------------------------------- state fallback
+
+#: Recorded on the invoice when the buyer's state cannot be read from
+#: the order (e.g. a draft order with no customer/address) and the
+#: seller's state is used as the place of supply (intra-state split).
+STATE_FALLBACK_NOTE = ("Place of supply: buyer address unavailable "
+                       "— seller state used")
+
+#: Plain-language message for the one case even the fallback cannot fix.
+STATE_UNRESOLVED_MSG = (
+    "Could not determine the place of supply for this order: the order "
+    "has no usable buyer address/state, and the seller state code in "
+    "the shop's settings is not a recognised GST state code. Please "
+    "check the seller state code under Seller settings and try again.")
+
+# GST state code -> Shopify province_code (reverse of the pipeline map)
+GST_TO_PROVINCE = {code: prov for prov, code in PROVINCE_TO_GST_CODE.items()}
+
+
+class StateResolutionError(ValueError):
+    """Place of supply could not be resolved even with seller fallback."""
+
+
+def _state_of(address) -> str | None:
+    try:
+        return gst_state_code(address or {})
+    except ValueError:
+        return None
+
+
+def apply_state_fallback(order_copy: dict, seller_cfg: dict) -> str | None:
+    """If the order carries no mappable buyer state, patch a copy of the
+    order so the place of supply falls back to the SELLER's state code
+    (from the shop's saved settings, or the demo seller when the shop
+    has none) and return STATE_FALLBACK_NOTE. Returns None when the
+    order's own buyer state is usable (nothing patched). Raises
+    StateResolutionError with a plain-language message when neither the
+    order nor the seller config yields a valid GST state code."""
+    ship = order_copy.get("shipping_address")
+    bill = order_copy.get("billing_address")
+    eff_ship = ship or bill or {}
+    eff_bill = bill or eff_ship
+    if _state_of(eff_ship) and _state_of(eff_bill):
+        return None
+    province = GST_TO_PROVINCE.get(
+        str(seller_cfg.get("state_code") or "").strip())
+    if not province:
+        raise StateResolutionError(STATE_UNRESOLVED_MSG)
+    patched = False
+    for key in ("shipping_address", "billing_address"):
+        addr = order_copy.get(key)
+        if isinstance(addr, dict) and not _state_of(addr):
+            addr = dict(addr)
+            addr["province_code"] = province
+            order_copy[key] = addr
+            patched = True
+    if not patched:  # no address block at all — supply a minimal one
+        order_copy["shipping_address"] = {"province_code": province}
+    return STATE_FALLBACK_NOTE
 
 
 # ---------------------------------------------------------------- pages
@@ -392,6 +457,7 @@ def route_post(handler, default_seller: dict) -> bool:
     }
     # Series number: preview under lock, consume ONLY after the invoice
     # builds successfully — a failed build never burns a number.
+    state_note = None
     with _LOCK:
         rec = _load().get(shop) or {}
         seq = int(rec.get("next_number",
@@ -400,20 +466,33 @@ def route_post(handler, default_seller: dict) -> bool:
         order_copy = dict(order)
         order_copy["order_number"] = seq
         try:
+            state_note = apply_state_fallback(order_copy, seller_cfg)
             invoice = order_to_invoice(order_copy, seller_cfg)
             totals = compute_invoice(invoice)
-        except (ValueError, KeyError, TypeError) as exc:
+        except StateResolutionError as exc:
             handler._json(422, {"error": str(exc)})
+            return True
+        except (ValueError, KeyError, TypeError) as exc:
+            msg = str(exc)
+            if "province_code" in msg or "state code" in msg:
+                msg = STATE_UNRESOLVED_MSG
+            handler._json(422, {"error": msg})
             return True
         if get_settings(shop):
             rec = _load().setdefault(shop, {})
             rec["next_number"] = seq + 1
             _persist()
     invoice_html = render_html(invoice, totals)
+    if state_note:  # make the fallback visible on the printed invoice too
+        invoice_html = invoice_html.replace(
+            "</body>",
+            f"<p><em>{html.escape(state_note)}</em></p></body>")
     if "application/json" in (handler.headers.get("Accept") or ""):
         payload = {"invoice_number": invoice.number,
                    "totals": totals_sidecar(invoice, totals),
                    "html": invoice_html}
+        if state_note:
+            payload["notes"] = [state_note]
         handler._json(200, payload)
     else:
         handler._send(200, invoice_html.encode(),
