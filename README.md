@@ -28,6 +28,9 @@ Configuration comes only from environment variables (never files):
 `read_products,read_orders,read_customers,read_draft_orders`) and `HOST`
 (the app's public base URL). Without them the `/auth*` routes answer
 "not configured" while `/`, `/invoice` and `/health` keep working.
+Access tokens are cached in memory and persisted through the storage
+layer below (Phase 3), so they survive restarts when a database is
+configured.
 
 ## Phase 2 — settings, real orders, order invoices
 
@@ -51,12 +54,34 @@ Configuration comes only from environment variables (never files):
   route does not cross-check Shopify's header totals (real orders can
   include shipping etc. that the line-item engine does not model).
 
-Storage: settings + the series counter are kept per shop in one JSON
-file under `DATA_DIR` (env, default `/tmp`) with an in-memory cache.
-**Limitation: on Render's free tier the disk is ephemeral — settings
-and the counter are lost on restart/redeploy.** A persistent database
-is planned for a later phase; this store is for the dev-store stage.
-Access tokens are still memory-only and never written to disk.
+Storage: settings, the series counter and access tokens go through
+the storage layer below (Phase 3) — see the next section.
+
+## Phase 3 — persistent storage (storage.py)
+
+One interface (`get_shop` / `save_shop_settings` / `save_shop_token` /
+`get_shop_token` / atomic invoice-series peek + commit) with two
+backends:
+
+- **Neon Postgres (when `DATABASE_URL` is set):** set `DATABASE_URL`
+  to the Neon connection string (from the Neon console / Render env —
+  never commit it). Queries run over Neon's SQL-over-HTTPS endpoint
+  (`https://<host>/sql`, connection string in the
+  `Neon-Connection-String` header, stdlib `urllib` only). A single
+  table `shops(shop_domain TEXT PRIMARY KEY, settings JSONB,
+  access_token TEXT, next_invoice_no INT, prefix TEXT,
+  updated_at TIMESTAMPTZ)` is created on first use. Settings, tokens
+  and the invoice series now **survive restarts and redeploys**; the
+  series commit is an atomic compare-and-swap, so an invoice number
+  can never be issued twice.
+- **Local file fallback (no `DATABASE_URL`):** exactly the Phase 2
+  behaviour — one JSON file under `DATA_DIR` (env, default `/tmp`).
+  **Limitation: on Render's free tier that disk is ephemeral** —
+  settings, tokens and the counter are lost on restart/redeploy.
+  Use the Neon backend for anything real.
+
+`NEON_HTTP_BASE` is a test-only hook that overrides the SQL endpoint
+base URL (local stub); never set it in production.
 
 ## Deploy (Render free tier)
 
@@ -70,4 +95,7 @@ python3 test_deploy.py   # boots on $PORT and verifies both sample orders
 python3 test_backend.py  # OAuth + embedded UI checks (dummy env)
 python3 test_phase2.py   # settings/orders/order-invoice vs a local
                          # stub Shopify API (dummy token, no network)
+python3 test_storage.py  # persistent storage: file + Neon-stub
+                         # lifecycles across fresh processes, plus a
+                         # full service-restart check (INV/500 -> 501)
 ```

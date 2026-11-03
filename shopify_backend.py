@@ -15,8 +15,10 @@ Secrets come ONLY from the environment — never from files:
              not a URL the caller's request Host header is used instead)
 
 If the Shopify env is missing, /auth* answer a clear "not configured"
-while /, /invoice and /health keep working. Access tokens live in a
-plain in-memory dict — never written to disk.
+while /, /invoice and /health keep working. Access tokens are kept in
+an in-memory cache on top of the persistent storage layer
+(storage.py): with DATABASE_URL set they survive restarts/redeploys
+in Neon; tokens are never printed or logged.
 """
 from __future__ import annotations
 
@@ -30,11 +32,42 @@ import secrets as _secrets
 import urllib.request
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
+import storage
+
 DEFAULT_SCOPES = "read_products,read_orders,read_customers,read_draft_orders"
 SHOP_RE = re.compile(r"^[a-z0-9][a-z0-9-]*\.myshopify\.com$")
 
-# shop domain -> access token (memory only, lost on restart — fine for v1)
+# shop domain -> access token (in-memory cache; the persistent copy
+# lives in the storage layer — see get_token/set_token below)
 TOKENS: dict[str, str] = {}
+
+
+def get_token(shop: str) -> str | None:
+    """Token for a shop: memory cache first, then persistent storage
+    (so a token earned before a restart/redeploy is still usable)."""
+    if TOKENS.get(shop):
+        return TOKENS[shop]
+    try:
+        token = storage.get_shop_token(shop)
+    except Exception:
+        token = None
+    if token:
+        TOKENS[shop] = token
+    return token
+
+
+def has_token(shop: str) -> bool:
+    return get_token(shop) is not None
+
+
+def set_token(shop: str, token: str) -> None:
+    """Cache a fresh token and persist it. A storage failure must not
+    break the OAuth flow — the in-memory copy still serves this run."""
+    TOKENS[shop] = token
+    try:
+        storage.save_shop_token(shop, token)
+    except Exception:
+        pass
 
 
 def config() -> dict:
@@ -211,7 +244,7 @@ def route_get(handler, sample_order: dict) -> bool:
         handler._json(400, {"error": "missing code"})
         return True
     try:
-        TOKENS[shop] = exchange_code(shop, code, cfg)
+        set_token(shop, exchange_code(shop, code, cfg))
     except Exception as exc:  # Shopify unreachable / bad code etc.
         handler._json(502, {"error": f"token exchange failed: {exc}"})
         return True

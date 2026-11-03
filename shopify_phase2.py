@@ -17,18 +17,19 @@ pipeline (pipeline.order_to_invoice). The GST engine package
                               the seller's state as place of supply, with
                               a note recorded on the invoice
 
-Storage: per-shop settings + invoice-series counter live in one JSON
-file under DATA_DIR (env, default /tmp) with an in-memory cache.
-WARNING: on Render's free tier the disk is EPHEMERAL — settings and the
-series counter are lost on restart/redeploy. A persistent DB is a later
-phase; this file store is for the dev-store stage only.
+Storage: per-shop settings, the invoice-series counter and the OAuth
+access token all go through the Phase 3 storage layer (storage.py) —
+Neon Postgres when DATABASE_URL is set (survives restart/redeploy),
+otherwise the local JSON file under DATA_DIR (env, default /tmp),
+which on Render's free tier is EPHEMERAL (lost on restart/redeploy).
 
-Secrets/tokens: never read from or written to files here. The OAuth
-access token comes from shopify_backend.TOKENS (memory only). The
-SHOPIFY_TEST_TOKENS env (JSON {"shop": "token"}) exists ONLY so local
-tests can inject a dummy token; never set it in production.
-SHOPIFY_API_BASE similarly lets tests point the Admin API at a local
-stub instead of https://<shop>.
+Secrets/tokens: token reads/writes go through shopify_backend's
+get_token/set_token (memory cache + storage layer); token values are
+never printed or logged here. The SHOPIFY_TEST_TOKENS env
+(JSON {"shop": "token"}) exists ONLY so local tests can inject a
+dummy token; never set it in production. SHOPIFY_API_BASE similarly
+lets tests point the Admin API at a local stub instead of
+https://<shop>.
 """
 from __future__ import annotations
 
@@ -39,10 +40,10 @@ import re
 import threading
 import urllib.error
 import urllib.request
-from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
 
 import shopify_backend
+import storage
 from pipeline import (PROVINCE_TO_GST_CODE, gst_state_code,
                       order_to_invoice, totals_sidecar)
 from gst_invoice.render import render_html
@@ -54,11 +55,7 @@ GSTIN_RE = re.compile(r"^\d{2}[A-Z]{5}\d{4}[A-Z][A-Z0-9]Z[A-Z0-9]$")
 STATE_CODE_RE = re.compile(r"^\d{2}$")
 PREFIX_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,11}$")
 
-DATA_DIR = Path(os.environ.get("DATA_DIR", "/tmp"))
-STORE_FILE = DATA_DIR / "gst_invoice_shop_settings.json"
-
 _LOCK = threading.Lock()
-_CACHE: dict[str, dict] | None = None  # shop -> record (settings + counter)
 
 if os.environ.get("SHOPIFY_TEST_TOKENS"):  # local tests only — dummy token
     try:
@@ -69,29 +66,21 @@ if os.environ.get("SHOPIFY_TEST_TOKENS"):  # local tests only — dummy token
 
 
 # ---------------------------------------------------------------- store
+# All persistence goes through storage.py (Phase 3): Neon when
+# DATABASE_URL is set, else the local JSON file this module used in
+# Phase 2 — same file, same shape, no behaviour change without a DB.
 
-def _load() -> dict[str, dict]:
-    global _CACHE
-    if _CACHE is None:
-        try:
-            _CACHE = json.loads(STORE_FILE.read_text())
-            if not isinstance(_CACHE, dict):
-                _CACHE = {}
-        except (OSError, ValueError):
-            _CACHE = {}
-    return _CACHE
-
-
-def _persist() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = STORE_FILE.with_suffix(".tmp")
-    tmp.write_text(json.dumps(_load(), indent=2))
-    tmp.replace(STORE_FILE)
+def _record(shop: str) -> dict:
+    """Shop record from the storage layer; {} if absent/unreachable."""
+    try:
+        return storage.get_shop(shop) or {}
+    except Exception:
+        return {}
 
 
 def get_settings(shop: str) -> dict | None:
-    rec = _load().get(shop)
-    return dict(rec["settings"]) if rec and "settings" in rec else None
+    settings = _record(shop).get("settings")
+    return dict(settings) if isinstance(settings, dict) else None
 
 
 def validate_settings(data: dict) -> list[str]:
@@ -128,11 +117,8 @@ def save_settings(shop: str, data: dict) -> dict:
         "state_code": data["state_code"].strip(),
         "invoice_prefix": data["invoice_prefix"].strip(),
     }
-    with _LOCK:
-        store = _load()
-        store[shop] = {"settings": settings,
-                       "next_number": int(data["start_number"])}
-        _persist()
+    storage.save_shop_settings(shop, settings,
+                               next_number=int(data["start_number"]))
     return settings
 
 
@@ -164,7 +150,7 @@ def _shopify_errors_detail(exc: urllib.error.HTTPError) -> str:
 
 
 def api_get(shop: str, path: str) -> dict:
-    token = shopify_backend.TOKENS.get(shop)
+    token = shopify_backend.get_token(shop)
     if not token:
         raise PermissionError("no access token for shop")
     req = urllib.request.Request(
@@ -359,14 +345,14 @@ def route_get(handler, sample_order: dict) -> bool:
     if parsed.path == "/settings":
         saved = get_settings(shop) or {}
         values = dict(saved)
-        rec = _load().get(shop) or {}
-        values["start_number"] = rec.get("next_number", 1)
+        values["start_number"] = _record(shop).get(
+            "next_invoice_no") or 1
         handler._send(200, settings_page(shop, values),
                       "text/html; charset=utf-8")
         return True
 
     # /orders
-    if shop not in shopify_backend.TOKENS:
+    if not shopify_backend.has_token(shop):
         handler._send(200, connect_page(shop), "text/html; charset=utf-8")
         return True
     try:
@@ -437,7 +423,7 @@ def route_post(handler, default_seller: dict) -> bool:
     if not order_id:
         handler._json(400, {"error": "order_id is required"})
         return True
-    if shop not in shopify_backend.TOKENS:
+    if not shopify_backend.has_token(shop):
         handler._json(401, {"error": "shop not connected — authorize first",
                             "auth_url": f"/auth?shop={shop}"})
         return True
@@ -455,14 +441,24 @@ def route_post(handler, default_seller: dict) -> bool:
         "state_code": str(settings.get("state_code", "")),
         "invoice_prefix": settings.get("invoice_prefix", "SHP"),
     }
-    # Series number: preview under lock, consume ONLY after the invoice
-    # builds successfully — a failed build never burns a number.
+    # Series number: peek under lock, consume ONLY after the invoice
+    # builds successfully — a failed build never burns a number. The
+    # consume step is the storage layer's atomic compare-and-swap, so
+    # the same number can never be issued twice, even across restarts.
     state_note = None
+    has_settings = get_settings(shop) is not None
     with _LOCK:
-        rec = _load().get(shop) or {}
-        seq = int(rec.get("next_number",
-                          settings.get("start_number") or 1)) \
-            if get_settings(shop) else int(order.get("order_number") or 0)
+        if has_settings:
+            try:
+                seq = storage.peek_invoice_number(shop)
+            except Exception as exc:
+                handler._json(502, {"error":
+                                    f"storage unavailable: {exc}"})
+                return True
+            if seq is None:
+                seq = 1
+        else:
+            seq = int(order.get("order_number") or 0)
         order_copy = dict(order)
         order_copy["order_number"] = seq
         try:
@@ -478,10 +474,14 @@ def route_post(handler, default_seller: dict) -> bool:
                 msg = STATE_UNRESOLVED_MSG
             handler._json(422, {"error": msg})
             return True
-        if get_settings(shop):
-            rec = _load().setdefault(shop, {})
-            rec["next_number"] = seq + 1
-            _persist()
+        if has_settings:
+            try:
+                storage.commit_invoice_number(shop, seq)
+            except Exception as exc:
+                handler._json(502, {"error":
+                                    f"could not save invoice number: "
+                                    f"{exc}"})
+                return True
     invoice_html = render_html(invoice, totals)
     if state_note:  # make the fallback visible on the printed invoice too
         invoice_html = invoice_html.replace(
