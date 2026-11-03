@@ -34,6 +34,7 @@ import json
 import os
 import re
 import threading
+import urllib.error
 import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qsl, urlparse
@@ -138,6 +139,26 @@ def _api_url(shop: str, path: str) -> str:
     return (base + path) if base else (f"https://{shop}" + path)
 
 
+def _shopify_errors_detail(exc: urllib.error.HTTPError) -> str:
+    """Extract ONLY the 'errors' field from Shopify's error response
+    body (e.g. "[API] This action requires merchant approval for
+    protected customer data") so the real cause is visible in our error
+    pages. Never includes headers, tokens or the rest of the body.
+    Whitespace-collapsed and capped at ~300 chars."""
+    try:
+        raw = exc.read().decode("utf-8", "replace")
+        errs = json.loads(raw).get("errors")
+    except Exception:
+        return ""
+    if isinstance(errs, str):
+        text = errs
+    elif errs is not None:
+        text = json.dumps(errs)
+    else:
+        return ""
+    return " ".join(text.split())[:300]
+
+
 def api_get(shop: str, path: str) -> dict:
     token = shopify_backend.TOKENS.get(shop)
     if not token:
@@ -146,8 +167,15 @@ def api_get(shop: str, path: str) -> dict:
         _api_url(shop, path),
         headers={"X-Shopify-Access-Token": token,
                  "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        detail = _shopify_errors_detail(exc)
+        msg = f"Shopify API error (HTTP {exc.code})"
+        if detail:
+            msg += f": {detail}"
+        raise RuntimeError(msg) from None
 
 
 def fetch_orders(shop: str) -> list[dict]:
