@@ -199,6 +199,11 @@ class NeonStore:
             raise StorageConflict(
                 f"invoice number {expected} already consumed for {shop}")
 
+    def delete_shop(self, shop: str) -> None:
+        """Erase every stored trace of a shop (GDPR shop/redact)."""
+        self._ensure_table()
+        self._query("DELETE FROM shops WHERE shop_domain = $1", [shop])
+
 
 # ------------------------------------------------------------ file store
 
@@ -275,6 +280,13 @@ class FileStore:
             rec["next_number"] = int(expected) + 1
             self._persist()
 
+    def delete_shop(self, shop: str) -> None:
+        """Erase every stored trace of a shop (GDPR shop/redact)."""
+        with self._lock:
+            if shop in self._load():
+                del self._load()[shop]
+                self._persist()
+
 
 # ------------------------------------------------------------- selection
 
@@ -324,3 +336,7 @@ def peek_invoice_number(shop: str) -> int | None:
 
 def commit_invoice_number(shop: str, expected: int) -> None:
     backend().commit_invoice_number(shop, expected)
+
+
+def delete_shop(shop: str) -> None:
+    backend().delete_shop(shop)

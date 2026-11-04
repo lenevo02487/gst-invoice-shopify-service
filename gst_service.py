@@ -50,6 +50,7 @@ from pipeline import order_to_invoice, totals_sidecar  # noqa: E402
 from gst_invoice.render import render_html  # noqa: E402
 from gst_invoice.tax import compute_invoice  # noqa: E402
 from shopify_backend import route_get as shopify_route_get  # noqa: E402
+from shopify_backend import route_post as shopify_route_post  # noqa: E402
 from shopify_phase2 import route_get as phase2_route_get  # noqa: E402
 from shopify_phase2 import route_post as phase2_route_post  # noqa: E402
 
@@ -107,6 +108,8 @@ def make_handler(default_seller: dict, sample_order: dict | None = None):
 
         def do_POST(self) -> None:  # noqa: N802 (stdlib naming)
             from urllib.parse import urlparse
+            if shopify_route_post(self):
+                return  # GDPR webhooks handled by shopify_backend
             if phase2_route_post(self, default_seller):
                 return  # /settings, /order-invoice handled by shopify_phase2
             if urlparse(self.path).path != "/invoice":
