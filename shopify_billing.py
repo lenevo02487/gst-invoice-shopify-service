@@ -32,6 +32,7 @@ from __future__ import annotations
 import html
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 
@@ -103,10 +104,47 @@ def graphql_url(shop: str) -> str:
     return f"{root}/admin/api/{API_VERSION}/graphql.json"
 
 
+def _sanitize(text: str, token: str | None = None) -> str:
+    """Mask any access-token value before text enters an error message.
+    Shopify error bodies do not normally carry the token, but never
+    let one through: the caller's exact token and any shpat_... value
+    are replaced with ***."""
+    if token:
+        text = text.replace(token, "***")
+    return re.sub(r"shpat_[A-Za-z0-9_-]+", "***", text)
+
+
+def _format_graphql_errors(errors: object, token: str | None = None) -> str:
+    """Top-level GraphQL `errors` array -> one readable line: each
+    error's message, with its path / error code when Shopify sent one."""
+    parts = []
+    if isinstance(errors, list):
+        for err in errors:
+            if isinstance(err, dict):
+                msg = str(err.get("message") or err)
+                extras = []
+                if err.get("path"):
+                    extras.append("path=" + "/".join(
+                        str(p) for p in err["path"]))
+                code = (err.get("extensions") or {}).get("code")
+                if code:
+                    extras.append(f"code={code}")
+                if extras:
+                    msg += " (" + ", ".join(extras) + ")"
+                parts.append(msg)
+            else:
+                parts.append(str(err))
+    if not parts:
+        parts.append(str(errors))
+    return _sanitize("; ".join(parts), token)[:500]
+
+
 def graphql_request(shop: str, token: str, query: str,
                     variables: dict | None = None) -> dict:
     """POST one GraphQL operation; returns the decoded response body.
-    Raises BillingError on HTTP failure or a top-level GraphQL error."""
+    Raises BillingError on HTTP failure — with the response body
+    included (sanitized, ~500 chars) so Shopify's actual reason is
+    visible — or on a top-level GraphQL `errors` array."""
     payload: dict = {"query": query}
     if variables is not None:
         payload["variables"] = variables
@@ -118,12 +156,19 @@ def graphql_request(shop: str, token: str, query: str,
         with urllib.request.urlopen(req, timeout=20) as resp:
             body = json.loads(resp.read() or b"{}")
     except urllib.error.HTTPError as exc:
-        raise BillingError(f"graphql HTTP {exc.code}") from None
+        try:
+            raw = exc.read().decode("utf-8", "replace")
+        except Exception:
+            raw = ""
+        detail = _sanitize(raw.strip(), token)[:500]
+        suffix = f": {detail}" if detail else " (empty response body)"
+        raise BillingError(f"graphql HTTP {exc.code}{suffix}") from None
     except Exception as exc:
         raise BillingError(f"graphql request failed: {exc}") from None
     if isinstance(body, dict) and body.get("errors"):
         raise BillingError(
-            f"graphql errors: {json.dumps(body['errors'])[:200]}")
+            "graphql errors: "
+            + _format_graphql_errors(body["errors"], token))
     return body if isinstance(body, dict) else {}
 
 

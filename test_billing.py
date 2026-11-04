@@ -9,6 +9,10 @@ Unit checks (in-process):
     plan / malformed).
   * webhook HMAC helper: correct vs wrong signature.
   * storage.delete_shop removes a shop from the file backend.
+  * GraphQL error surfacing: an HTTP 403 body lands (sanitized — no
+    token/shpat_ value) in the raised error; a 200 with a GraphQL
+    `errors` array becomes a readable message with its error code;
+    /billing/subscribe passes Shopify's reason through in its 502.
 
 End-to-end (service booted with DUMMY env; a local stub stands in for
 the Shopify GraphQL endpoint via SHOPIFY_API_BASE):
@@ -45,6 +49,8 @@ SVC_PORT = 8891
 SHOP_NEW = "billing-shop.myshopify.com"
 SHOP_ACTIVE = "active-shop.myshopify.com"
 SHOP_REDACT = "redact-shop.myshopify.com"
+SHOP_FORBID = "forbid-shop.myshopify.com"
+SHOP_GQLERR = "gqlerr-shop.myshopify.com"
 CONFIRM_URL = "https://example.test/confirm/abc123"
 
 MUTATION_SEEN: list[dict] = []
@@ -58,7 +64,21 @@ class StubHandler(BaseHTTPRequestHandler):
         body = json.loads(self.rfile.read(length) or b"{}")
         query = body.get("query", "")
         token = self.headers.get("X-Shopify-Access-Token", "")
-        if "appSubscriptionCreate" in query:
+        if token == "tok-forbid":
+            raw = json.dumps(
+                {"error": "billing not enabled for this app",
+                 "echo": "shpat_deadbeefsecret"}).encode()
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+            return
+        elif token == "tok-gqlerr":
+            payload = {"errors": [{
+                "message": "Throttled - too many requests",
+                "extensions": {"code": "THROTTLED"}}]}
+        elif "appSubscriptionCreate" in query:
             MUTATION_SEEN.append(body)
             payload = {"data": {"appSubscriptionCreate": {
                 "confirmationUrl": CONFIRM_URL,
@@ -182,6 +202,18 @@ def main() -> int:
     check("parse: malformed body -> inactive, no crash",
           billing.parse_subscription_status({})["active"] is False)
 
+    # ------------------------------------------ unit: error surfacing
+    check("errors-format: message + path + code readable",
+          billing._format_graphql_errors(
+              [{"message": "Access denied",
+                "path": ["appSubscriptionCreate"],
+                "extensions": {"code": "ACCESS_DENIED"}}])
+          == "Access denied (path=appSubscriptionCreate, "
+             "code=ACCESS_DENIED)")
+    check("sanitize: caller token + shpat_ values masked",
+          billing._sanitize("tok shpat_abc123XYZ end", "tok")
+          == "*** *** end")
+
     # ------------------------------------------------ unit: webhook hmac
     import shopify_backend
     raw = b'{"shop_domain":"x.myshopify.com"}'
@@ -217,7 +249,9 @@ def main() -> int:
     import threading
     threading.Thread(target=stub.serve_forever, daemon=True).start()
     data_dir = tempfile.mkdtemp(prefix="gst-billing-test-")
-    tokens = json.dumps({SHOP_NEW: "tok-none", SHOP_ACTIVE: "tok-active"})
+    tokens = json.dumps({SHOP_NEW: "tok-none", SHOP_ACTIVE: "tok-active",
+                         SHOP_FORBID: "tok-forbid",
+                         SHOP_GQLERR: "tok-gqlerr"})
     proc = boot(SVC_PORT, {
         "SHOPIFY_API_KEY": KEY, "SHOPIFY_API_SECRET": SECRET,
         "HOST": "https://example-app.test",
@@ -255,6 +289,40 @@ def main() -> int:
         status, _, _ = http_req(SVC_PORT, "GET",
                                 "/billing/subscribe?shop=evil.example.com")
         check("subscribe: invalid shop -> 400", status == 400,
+              f"status={status}")
+
+        # Error-body surfacing, direct against the stub: a 403 must
+        # carry Shopify's reason (sanitized) and a 200 with a GraphQL
+        # errors array must surface a readable message.
+        os.environ["SHOPIFY_API_BASE"] = f"http://127.0.0.1:{STUB_PORT}"
+        err403 = ""
+        try:
+            billing.graphql_request(
+                SHOP_FORBID, "tok-forbid", billing.CREATE_MUTATION,
+                billing.build_subscription_variables(
+                    "https://example-app.test/"))
+        except billing.BillingError as exc:
+            err403 = str(exc)
+        check("graphql 403: Shopify body in error, token masked",
+              "403" in err403 and "billing not enabled" in err403
+              and "shpat_deadbeefsecret" not in err403
+              and "***" in err403, f"err={err403[:120]}")
+        err_gql = ""
+        try:
+            billing.graphql_request(SHOP_GQLERR, "tok-gqlerr",
+                                    billing.STATUS_QUERY)
+        except billing.BillingError as exc:
+            err_gql = str(exc)
+        check("graphql errors array: readable message + code",
+              "Throttled" in err_gql and "THROTTLED" in err_gql,
+              f"err={err_gql[:120]}")
+        os.environ.pop("SHOPIFY_API_BASE", None)
+
+        status, _, body = http_req(
+            SVC_PORT, "GET", f"/billing/subscribe?shop={SHOP_FORBID}")
+        check("subscribe 403: 502 carries Shopify's reason, no secret",
+              status == 502 and "billing not enabled" in body
+              and "shpat_deadbeefsecret" not in body,
               f"status={status}")
 
         status, _, body = http_req(SVC_PORT, "GET", "/privacy")
