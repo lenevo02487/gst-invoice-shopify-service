@@ -19,6 +19,19 @@ while /, /invoice and /health keep working. Access tokens are kept in
 an in-memory cache on top of the persistent storage layer
 (storage.py): with DATABASE_URL set they survive restarts/redeploys
 in Neon; tokens are never printed or logged.
+
+Expiring offline tokens: Shopify no longer accepts non-expiring
+access tokens on the Admin API ("Non-expiring access tokens are no
+longer accepted... Start using expiring offline tokens"), so the
+OAuth code exchange asks for an expiring token (expiring=1) and
+stores the returned refresh_token + expiry alongside the access
+token. get_token() transparently refreshes through the stored
+refresh token when the access token is expired (or within
+REFRESH_BUFFER_SECONDS of it), so every caller — the REST orders
+path and the GraphQL billing path alike — always gets a live token.
+Tokens saved before this change (no refresh token, no expiry) keep
+working exactly as before. If a refresh fails, get_token returns
+None and token_error(shop) explains that the shop must re-authorize.
 """
 from __future__ import annotations
 
@@ -29,6 +42,7 @@ import json
 import os
 import re
 import secrets as _secrets
+import time
 import urllib.request
 from urllib.parse import parse_qsl, quote, urlencode, urlparse
 
@@ -42,19 +56,82 @@ SHOP_RE = re.compile(r"^[a-z0-9][a-z0-9-]*\.myshopify\.com$")
 # lives in the storage layer — see get_token/set_token below)
 TOKENS: dict[str, str] = {}
 
+# shop domain -> {"access_token", "refresh_token", "token_expires_at"}
+# for expiring offline tokens (the persistent copy lives in storage).
+AUTH: dict[str, dict] = {}
+
+# shop domain -> last token error (e.g. a failed refresh), so routes
+# can tell the merchant a re-authorize is needed instead of guessing.
+TOKEN_ERRORS: dict[str, str] = {}
+
+#: Refresh an expiring token this many seconds BEFORE it expires.
+REFRESH_BUFFER_SECONDS = 300
+
+
+def token_error(shop: str) -> str | None:
+    """Why the shop currently has no usable token, if known."""
+    return TOKEN_ERRORS.get(shop)
+
+
+def _load_auth(shop: str) -> dict | None:
+    """Token record for a shop: memory cache first, then persistent
+    storage (so a token earned before a restart/redeploy is still
+    usable). Records saved before expiring tokens existed come back
+    with refresh_token / token_expires_at = None."""
+    if shop in AUTH:
+        return AUTH[shop]
+    try:
+        record = storage.get_shop_auth(shop)
+    except Exception:
+        record = None
+    if record:
+        AUTH[shop] = record
+        TOKENS[shop] = record["access_token"]
+    return record
+
+
+def _refresh_record(shop: str, record: dict, cfg: dict) -> dict:
+    """Trade the stored refresh token for a fresh token pair.
+    Shopify rotates the refresh token on every refresh, so the new
+    pair (access token + refresh token + expiry) replaces the old."""
+    payload = _post_token_request(shop, {
+        "client_id": cfg["api_key"],
+        "client_secret": cfg["api_secret"],
+        "grant_type": "refresh_token",
+        "refresh_token": record["refresh_token"],
+    })
+    fresh = _record_from_token_response(payload)
+    if not fresh.get("access_token"):
+        raise ValueError("no access_token in refresh response")
+    if not fresh.get("refresh_token"):
+        fresh["refresh_token"] = record["refresh_token"]
+    return fresh
+
 
 def get_token(shop: str) -> str | None:
-    """Token for a shop: memory cache first, then persistent storage
-    (so a token earned before a restart/redeploy is still usable)."""
-    if TOKENS.get(shop):
-        return TOKENS[shop]
-    try:
-        token = storage.get_shop_token(shop)
-    except Exception:
-        token = None
-    if token:
-        TOKENS[shop] = token
-    return token
+    """Live access token for a shop, refreshing an expiring token
+    through its stored refresh token when expiry is near/past.
+    Returns None when there is no token, or when a needed refresh
+    failed — token_error(shop) then says a re-authorize is needed."""
+    record = _load_auth(shop)
+    if record is None:
+        return TOKENS.get(shop)
+    expires_at = record.get("token_expires_at")
+    if (record.get("refresh_token") and expires_at is not None
+            and time.time() >= float(expires_at) - REFRESH_BUFFER_SECONDS):
+        try:
+            fresh = _refresh_record(shop, record, config())
+        except Exception as exc:
+            TOKEN_ERRORS[shop] = (
+                "re-authorize needed: the shop's access token expired "
+                f"and its refresh failed ({exc}); open the app's "
+                "connect/authorize link to reconnect the shop")
+            AUTH.pop(shop, None)
+            TOKENS.pop(shop, None)
+            return None
+        set_auth(shop, fresh)
+        return fresh["access_token"]
+    return record["access_token"]
 
 
 def has_token(shop: str) -> bool:
@@ -67,6 +144,20 @@ def set_token(shop: str, token: str) -> None:
     TOKENS[shop] = token
     try:
         storage.save_shop_token(shop, token)
+    except Exception:
+        pass
+
+
+def set_auth(shop: str, record: dict) -> None:
+    """Cache + persist a full token record (access token, refresh
+    token, expiry) from an OAuth exchange or a refresh."""
+    AUTH[shop] = record
+    TOKENS[shop] = record["access_token"]
+    TOKEN_ERRORS.pop(shop, None)
+    try:
+        storage.save_shop_auth(shop, record["access_token"],
+                               record.get("refresh_token"),
+                               record.get("token_expires_at"))
     except Exception:
         pass
 
@@ -119,18 +210,53 @@ def valid_hmac(pairs: list[tuple[str, str]], secret: str) -> bool:
     return hmac.compare_digest(digest, given)
 
 
-def exchange_code(shop: str, code: str, cfg: dict) -> str:
-    """POST the OAuth code to Shopify and return the access token."""
-    body = json.dumps({
+def _token_endpoint(shop: str) -> str:
+    """OAuth token endpoint. SHOPIFY_API_BASE (tests only) overrides
+    https://<shop>, mirroring shopify_phase2.py / shopify_billing.py."""
+    base = os.environ.get("SHOPIFY_API_BASE", "").rstrip("/")
+    root = base if base else f"https://{shop}"
+    return f"{root}/admin/oauth/access_token"
+
+
+def _post_token_request(shop: str, payload: dict) -> dict:
+    req = urllib.request.Request(
+        _token_endpoint(shop), data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read() or b"{}")
+
+
+def _record_from_token_response(payload: dict) -> dict:
+    """Token-endpoint JSON -> stored record shape. expires_in (seconds
+    from now) becomes an absolute token_expires_at epoch; when Shopify
+    returns no expires_in/refresh_token (a non-expiring token), both
+    stay None and the record behaves like a legacy token."""
+    expires_in = payload.get("expires_in")
+    try:
+        expires_at = (time.time() + float(expires_in)
+                      if expires_in is not None else None)
+    except (TypeError, ValueError):
+        expires_at = None
+    return {"access_token": payload.get("access_token"),
+            "refresh_token": payload.get("refresh_token"),
+            "token_expires_at": expires_at}
+
+
+def exchange_code(shop: str, code: str, cfg: dict) -> dict:
+    """POST the OAuth code to Shopify, asking for an EXPIRING offline
+    token (expiring=1) — non-expiring tokens are no longer accepted
+    on the Admin API. Returns the full token record: access_token,
+    refresh_token and token_expires_at."""
+    payload = _post_token_request(shop, {
         "client_id": cfg["api_key"],
         "client_secret": cfg["api_secret"],
         "code": code,
-    }).encode()
-    req = urllib.request.Request(
-        f"https://{shop}/admin/oauth/access_token", data=body,
-        headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read())["access_token"]
+        "expiring": "1",
+    })
+    record = _record_from_token_response(payload)
+    if not record.get("access_token"):
+        raise ValueError("no access_token in token response")
+    return record
 
 
 def app_ui_html(shop: str, sample_order: dict, configured: bool,
@@ -226,8 +352,9 @@ def route_get(handler, sample_order: dict) -> bool:
             return True
         token = get_token(shop)
         if not token:
-            handler._json(401, {"error": "shop not connected — "
-                                         "authorize first"})
+            handler._json(401, {"error": token_error(shop)
+                                         or "shop not connected — "
+                                            "authorize first"})
             return True
         base = app_base(cfg, handler.headers.get("Host"))
         return_url = f"{base}/?shop={quote(shop)}"
@@ -290,7 +417,7 @@ def route_get(handler, sample_order: dict) -> bool:
         handler._json(400, {"error": "missing code"})
         return True
     try:
-        set_token(shop, exchange_code(shop, code, cfg))
+        set_auth(shop, exchange_code(shop, code, cfg))
     except Exception as exc:  # Shopify unreachable / bad code etc.
         handler._json(502, {"error": f"token exchange failed: {exc}"})
         return True
@@ -413,6 +540,8 @@ def route_post(handler) -> bool:
         # series and the access token — from memory AND storage.
         if shop:
             TOKENS.pop(shop, None)
+            AUTH.pop(shop, None)
+            TOKEN_ERRORS.pop(shop, None)
             try:
                 storage.delete_shop(shop)
             except Exception:

@@ -6,6 +6,10 @@ One interface, two backends:
     save_shop_settings(shop, settings, next_number=None)
     save_shop_token(shop, token)
     get_shop_token(shop)      -> token string or None
+    save_shop_auth(shop, access_token, refresh_token=None,
+                   token_expires_at=None)
+    get_shop_auth(shop)       -> {"access_token", "refresh_token",
+                                  "token_expires_at"} or None
     peek_invoice_number(shop) -> next series number or None
     commit_invoice_number(shop, expected)
         Atomically advance the series from `expected` to `expected + 1`.
@@ -16,7 +20,13 @@ One interface, two backends:
 Record shape (both backends):
     {"shop": str, "settings": dict | None,
      "access_token": str | None, "next_invoice_no": int | None,
-     "prefix": str | None}
+     "prefix": str | None,
+     "refresh_token": str | None, "token_expires_at": int | None}
+
+The last two carry Shopify's EXPIRING offline-token pair: the access
+token's absolute expiry (epoch seconds) and the refresh token used to
+renew it. Records saved before expiring tokens existed simply have
+both as None and keep working (non-expiring legacy token).
 
 Backend (a) — Neon Postgres over HTTP: used when the DATABASE_URL env
 holds a Neon connection string. Queries go to Neon's SQL-over-HTTPS
@@ -25,9 +35,12 @@ the 'Neon-Connection-String' header, stdlib urllib only. One table:
 
     shops(shop_domain TEXT PRIMARY KEY, settings JSONB,
           access_token TEXT, next_invoice_no INT, prefix TEXT,
+          refresh_token TEXT, token_expires_at BIGINT,
           updated_at TIMESTAMPTZ)
 
-created lazily (CREATE TABLE IF NOT EXISTS) on first use.
+created lazily (CREATE TABLE IF NOT EXISTS) on first use; the two
+token columns are added with ALTER TABLE ... ADD COLUMN IF NOT EXISTS
+so a table created by an earlier version gains them in place.
 
 Backend (b) — local JSON file fallback: used when DATABASE_URL is not
 set. Same file and format as the Phase 2 store (DATA_DIR env, default
@@ -59,9 +72,18 @@ CREATE TABLE IF NOT EXISTS shops (
     access_token TEXT,
     next_invoice_no INT,
     prefix TEXT,
+    refresh_token TEXT,
+    token_expires_at BIGINT,
     updated_at TIMESTAMPTZ DEFAULT now()
 )
 """
+
+# Columns added after the first release of this table; applied
+# best-effort on first use so existing databases gain them in place.
+ADD_COLUMN_SQL = (
+    "ALTER TABLE shops ADD COLUMN IF NOT EXISTS refresh_token TEXT",
+    "ALTER TABLE shops ADD COLUMN IF NOT EXISTS token_expires_at BIGINT",
+)
 
 
 class StorageError(RuntimeError):
@@ -130,13 +152,19 @@ class NeonStore:
         with self._lock:
             if not self._table_ready:
                 self._query(CREATE_TABLE_SQL)
+                for ddl in ADD_COLUMN_SQL:
+                    try:
+                        self._query(ddl)
+                    except StorageError:
+                        pass  # column already there / old server
                 self._table_ready = True
 
     # -- interface
     def get_shop(self, shop: str) -> dict | None:
         self._ensure_table()
         rows = self._query(
-            "SELECT settings, access_token, next_invoice_no, prefix "
+            "SELECT settings, access_token, refresh_token, "
+            "token_expires_at, next_invoice_no, prefix "
             "FROM shops WHERE shop_domain = $1", [shop])
         if not rows:
             return None
@@ -146,6 +174,9 @@ class NeonStore:
             "invoice_prefix")
         return {"shop": shop, "settings": settings,
                 "access_token": row.get("access_token"),
+                "refresh_token": row.get("refresh_token"),
+                "token_expires_at": _int_or_none(
+                    row.get("token_expires_at")),
                 "next_invoice_no": _int_or_none(row.get("next_invoice_no")),
                 "prefix": prefix}
 
@@ -183,6 +214,33 @@ class NeonStore:
     def get_shop_token(self, shop: str) -> str | None:
         rec = self.get_shop(shop)
         return rec.get("access_token") if rec else None
+
+    def save_shop_auth(self, shop: str, access_token: str,
+                       refresh_token: str | None = None,
+                       token_expires_at=None) -> None:
+        """Store an (expiring) token set. A None refresh_token /
+        token_expires_at keeps the previously stored value, so a
+        plain access-token save never erases the refresh pair."""
+        self._ensure_table()
+        self._query(
+            "INSERT INTO shops (shop_domain, access_token, "
+            "refresh_token, token_expires_at) VALUES ($1, $2, $3, $4) "
+            "ON CONFLICT (shop_domain) DO UPDATE SET "
+            "access_token = EXCLUDED.access_token, "
+            "refresh_token = COALESCE(EXCLUDED.refresh_token, "
+            "shops.refresh_token), "
+            "token_expires_at = COALESCE(EXCLUDED.token_expires_at, "
+            "shops.token_expires_at), updated_at = now()",
+            [shop, access_token, refresh_token,
+             _int_or_none(token_expires_at)])
+
+    def get_shop_auth(self, shop: str) -> dict | None:
+        rec = self.get_shop(shop)
+        if not rec or not rec.get("access_token"):
+            return None
+        return {"access_token": rec["access_token"],
+                "refresh_token": rec.get("refresh_token"),
+                "token_expires_at": rec.get("token_expires_at")}
 
     def peek_invoice_number(self, shop: str) -> int | None:
         rec = self.get_shop(shop)
@@ -240,6 +298,9 @@ class FileStore:
                 "settings": dict(settings) if isinstance(
                     settings, dict) else None,
                 "access_token": rec.get("access_token"),
+                "refresh_token": rec.get("refresh_token"),
+                "token_expires_at": _int_or_none(
+                    rec.get("token_expires_at")),
                 "next_invoice_no": _int_or_none(rec.get("next_number")),
                 "prefix": (settings or {}).get("invoice_prefix")
                 if isinstance(settings, dict) else None}
@@ -264,6 +325,29 @@ class FileStore:
     def get_shop_token(self, shop: str) -> str | None:
         rec = self.get_shop(shop)
         return rec.get("access_token") if rec else None
+
+    def save_shop_auth(self, shop: str, access_token: str,
+                       refresh_token: str | None = None,
+                       token_expires_at=None) -> None:
+        """Store an (expiring) token set; None refresh/expiry values
+        keep whatever was stored before (see NeonStore.save_shop_auth)."""
+        with self._lock:
+            rec = dict(self._load().get(shop) or {})
+            rec["access_token"] = access_token
+            if refresh_token is not None:
+                rec["refresh_token"] = refresh_token
+            if token_expires_at is not None:
+                rec["token_expires_at"] = _int_or_none(token_expires_at)
+            self._load()[shop] = rec
+            self._persist()
+
+    def get_shop_auth(self, shop: str) -> dict | None:
+        rec = self.get_shop(shop)
+        if not rec or not rec.get("access_token"):
+            return None
+        return {"access_token": rec["access_token"],
+                "refresh_token": rec.get("refresh_token"),
+                "token_expires_at": rec.get("token_expires_at")}
 
     def peek_invoice_number(self, shop: str) -> int | None:
         rec = self.get_shop(shop)
@@ -328,6 +412,17 @@ def save_shop_token(shop: str, token: str) -> None:
 
 def get_shop_token(shop: str) -> str | None:
     return backend().get_shop_token(shop)
+
+
+def save_shop_auth(shop: str, access_token: str,
+                   refresh_token: str | None = None,
+                   token_expires_at=None) -> None:
+    backend().save_shop_auth(shop, access_token, refresh_token,
+                             token_expires_at)
+
+
+def get_shop_auth(shop: str) -> dict | None:
+    return backend().get_shop_auth(shop)
 
 
 def peek_invoice_number(shop: str) -> int | None:
